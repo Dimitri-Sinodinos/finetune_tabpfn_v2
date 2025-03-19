@@ -26,6 +26,7 @@ from finetuning_scripts.training_utils.ag_early_stopping import AdaptiveES
 from finetuning_scripts.training_utils.data_utils import get_data_loader
 from finetuning_scripts.training_utils.training_loss import compute_loss, get_loss
 from finetuning_scripts.training_utils.validation_utils import validate_tabpfn
+from finetuning_scripts.mt_adapter import MultiTaskAdapter
 from schedulefree import AdamWScheduleFree
 from tabpfn.base import load_model_criterion_config
 from torch import autocast
@@ -161,6 +162,9 @@ def fine_tune_tabpfn(
         model = DataParallel(model, device_ids=multiple_device_ids)
         is_data_parallel = True
     model.to(device)
+    n_tasks = y_train.shape[1]
+    adapter = MultiTaskAdapter(num_tasks=n_tasks)
+    adapter.to(device)
     if use_wandb:
         wandb.watch(model, log_freq=1, log="all")
 
@@ -193,6 +197,7 @@ def fine_tune_tabpfn(
     fts = _setup_tuning(
         **finetuning_config,
         model=model,
+        adapter=adapter,
         task_type=task_type,
         is_classification=is_classification,
     )
@@ -224,21 +229,23 @@ def fine_tune_tabpfn(
         X_train=torch.tensor(X_train.values)
         .reshape(X_train.shape[0], 1, X_train.shape[1])
         .float(),
-        y_train=torch.tensor(y_train.values).reshape(y_train.shape[0], 1, 1).float(),
+        y_train=torch.tensor(y_train.values).reshape(y_train.shape[0], 1, n_tasks).float(),
         X_val=torch.tensor(X_val.values)
         .reshape(X_val.shape[0], 1, X_val.shape[1])
         .float(),
-        y_val=torch.tensor(y_val.values).reshape(y_val.shape[0], 1, 1).float(),
+        y_val=torch.tensor(y_val.values).reshape(y_val.shape[0], 1, n_tasks).float(),
         validation_metric=validation_metric,
         model_forward_fn=model_forward_fn,
         task_type=task_type,
         device=device,
     )
     model.eval()
+    adapter.eval()
     optimizer.eval()
     with torch.no_grad():
         best_validation_loss = validate_tabpfn_fn(
             model=model,
+            adapter=adapter,
         )  # Initial validation loss
     adaptive_es.update(cur_round=0, is_best=True)
 
@@ -304,6 +311,7 @@ def fine_tune_tabpfn(
         validate_now = (step_i + 1) % fts.validate_every_n_steps == 0
 
         model.train()
+        adapter.train()
         optimizer.train()
         step_results = _fine_tune_step(
             batch_X_train=batch_data["X_train"],
@@ -317,6 +325,7 @@ def fine_tune_tabpfn(
             gradient_accumulation_steps=gradient_accumulation_steps,
             # Updated by the loop
             model=model,
+            adapter=adapter,
             scaler=scaler,
             step_with_update=update_now,
         )
@@ -329,9 +338,10 @@ def fine_tune_tabpfn(
         # -- Validate & save model
         if validate_now:
             model.eval()
+            adapter.eval()
             optimizer.eval()
             with torch.no_grad():
-                validation_loss = validate_tabpfn_fn(model=model)
+                validation_loss = validate_tabpfn_fn(model=model, adapter=adapter)
 
             # -- Check tuning state
             is_best = validation_loss < best_validation_loss
@@ -405,6 +415,7 @@ def fine_tune_tabpfn(
 def _model_forward(
     *,
     model: PerFeatureTransformer,
+    adapter: MultiTaskAdapter,
     X_train: torch.Tensor,  # (n_samples, batch_size, n_features)
     y_train: torch.Tensor,  # (n_samples, batch_size, 1)
     X_test: torch.Tensor,  # (n_samples, batch_size, n_features)
@@ -452,7 +463,11 @@ def _model_forward(
             - regression: (n_samples, batch_size)
     """
     is_classification = n_classes is not None
+    is_multitask = y_train.shape[-1] > 1
     if not is_classification:
+        # Make y_train 1 target if not already
+        if is_multitask:
+            y_train = y_train.mean(dim=-1, keepdim=True)
         # TabPFN model assumes z-normalized inputs.
         mean = y_train.mean(dim=0)
         std = y_train.std(dim=0)
@@ -483,6 +498,7 @@ def _model_forward(
         if softmax_temperature is not None:
             pred_logits = pred_logits / softmax_temperature
 
+        mtl_preds = adapter(pred_logits) if is_multitask is not None else None
         if forward_for_validation:
             new_pred_logits = []
             for batch_i in range(pred_logits.shape[1]):
@@ -493,7 +509,7 @@ def _model_forward(
                 new_pred_logits.append(bar_dist.mean(pred_logits[:, batch_i, :]))
             pred_logits = torch.stack(new_pred_logits, dim=-1)
 
-    return pred_logits
+    return pred_logits, mtl_preds
 
 
 def _fine_tune_step(
@@ -504,6 +520,7 @@ def _fine_tune_step(
     batch_y_test: torch.Tensor,
     device: SupportedDevice,
     model: PerFeatureTransformer,
+    adapter: MultiTaskAdapter,
     optimizer: Optimizer,
     model_forward_fn: Callable,
     loss_fn: _Loss,
@@ -555,14 +572,15 @@ def _fine_tune_step(
 
     # Forward Mixed Precision
     with autocast(device_type=device, enabled=scaler.is_enabled()):
-        pred_logits = model_forward_fn(  # autocast in model_forward_fn
+        pred_logits, mtl_preds = model_forward_fn(  # autocast in model_forward_fn
             model=model,
+            adapter=adapter,
             X_train=batch_X_train,
             y_train=batch_y_train,
             X_test=batch_X_test,
             outer_loop_autocast=True,
         )
-        loss = compute_loss(loss_fn=loss_fn, logits=pred_logits, target=batch_y_test)
+        loss = compute_loss(loss_fn=loss_fn, logits=pred_logits, target=batch_y_test, mtl_preds=mtl_preds)
 
         if gradient_accumulation_steps is not None:
             loss = loss / gradient_accumulation_steps
@@ -619,11 +637,12 @@ def _setup_tuning(
     data_loader_workers: int = 1,
     # Metadata
     model: PerFeatureTransformer,
+    adapter: MultiTaskAdapter,
     task_type: TaskType,
     is_classification: bool,
 ) -> FineTuneSetup:
     return FineTuneSetup(
-        optimizer=AdamWScheduleFree(model.parameters(), lr=learning_rate),
+        optimizer=AdamWScheduleFree(list(model.parameters()) + list(adapter.parameters()), lr=learning_rate),
         max_steps=max_steps,
         adaptive_es=AdaptiveES(
             adaptive_rate=adaptive_rate,

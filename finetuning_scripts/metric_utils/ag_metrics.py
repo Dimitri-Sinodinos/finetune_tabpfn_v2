@@ -19,7 +19,7 @@ import sklearn.metrics
 try:
     from sklearn.metrics._classification import type_of_target
 except:
-    from sklearn.metrics.classification import type_of_target
+    from sklearn.metrics.classification import type_of_target # type: ignore
 
 from finetuning_scripts.constant_utils import TaskType
 from finetuning_scripts.metric_utils import (

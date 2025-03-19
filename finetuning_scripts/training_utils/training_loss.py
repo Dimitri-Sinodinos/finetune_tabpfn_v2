@@ -47,6 +47,7 @@ def compute_loss(
     loss_fn: _Loss,
     logits: torch.Tensor,
     target: torch.Tensor,
+    mtl_preds=None,
 ) -> torch.Tensor:
     """Compute the loss of the model.
 
@@ -78,7 +79,19 @@ def compute_loss(
             logits = logits.reshape(-1, logits.shape[-1])
             target = target.long().flatten()
         case _ if isinstance(loss_fn, FullSupportBarDistribution):
-            return loss_fn(logits=logits, y=target[:, :, 0]).mean()
+            if mtl_preds is not None:
+                reg_loss = loss_fn(logits=logits, y=target.mean(dim=-1, keepdim=True)).mean()
+                # Compute RMSE for each task
+                task_rmse = torch.zeros(target.shape[-1], device=target.device)
+                for task_idx in range(target.shape[-1]):  # Loop through each regression target
+                    task_rmse[task_idx] = torch.sqrt(((target[:, task_idx] - mtl_preds[:, task_idx]) ** 2).mean())
+                # print(reg_loss, task_rmse.mean())
+                mtl_loss = reg_loss + task_rmse.mean()/15
+                return mtl_loss
+            else:
+                if target.shape[-1] == 1:
+                    target = target.mean(dim=-1, keepdim=True)
+                return loss_fn(logits=logits, y=target[:, :, 0]).mean()
         case _:
             raise ValueError(f"Loss of type {type(loss_fn)} not supported.")
 

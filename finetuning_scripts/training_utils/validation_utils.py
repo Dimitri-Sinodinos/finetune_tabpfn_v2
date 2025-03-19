@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from finetuning_scripts.constant_utils import SupportedDevice, TaskType
+from finetuning_scripts.mt_adapter import MultiTaskAdapter
 from sklearn.model_selection import train_test_split
 
 if TYPE_CHECKING:
@@ -55,6 +56,7 @@ def validate_tabpfn(
     y_val: torch.Tensor,  # (n_samples, batch_size, 1)
     validation_metric: Scorer,
     model: PerFeatureTransformer,
+    adapter: MultiTaskAdapter,
     model_forward_fn: Callable,
     task_type: TaskType,
     device: SupportedDevice,
@@ -69,8 +71,9 @@ def validate_tabpfn(
     X_val = X_val.to(device)
     y_val = y_val.to(device)
 
-    pred_logits = model_forward_fn(
+    pred_logits, _ = model_forward_fn(
         model=model,
+        adapter=adapter,
         X_train=X_train,
         y_train=y_train,
         X_test=X_val,
@@ -80,6 +83,8 @@ def validate_tabpfn(
     match task_type:
         case TaskType.REGRESSION:
             y_pred = pred_logits.float().flatten().cpu().detach().numpy()
+            if y_val.shape[-1] > 1:
+                y_val = y_val.mean(dim=-1, keepdim=True)
             y_true = y_val.float().flatten().cpu().detach().numpy()
         case TaskType.BINARY_CLASSIFICATION:
             # TODO: check that this works / is exhaustive.

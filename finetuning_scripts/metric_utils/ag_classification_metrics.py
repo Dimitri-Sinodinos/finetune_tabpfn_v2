@@ -18,7 +18,7 @@ from sklearn.utils.multiclass import unique_labels
 try:
     from sklearn.metrics._classification import _check_targets, type_of_target
 except:
-    from sklearn.metrics.classification import _check_targets, type_of_target
+    from sklearn.metrics.classification import _check_targets, type_of_target # type: ignore
 
 logger = logging.getLogger(__name__)
 
